@@ -558,24 +558,14 @@ jobs:
           }
           fs.writeFileSync('android/app/src/main/AndroidManifest.xml', manifest);
           EOF
-
-      - name: Apply App Icon
+          - name: Apply App Icon
         run: |
           if [ -f icon.png ]; then
-            for dir in android/app/src/main/res/mipmap-*; do
-              cp -f icon.png "$dir/ic_launcher.png" || true
-              cp -f icon.png "$dir/ic_launcher_round.png" || true
+            rm -rf android/app/src/main/res/mipmap-anydpi-v26
+            for dir in android/app/src/main/res/mipmap-*dpi; do
+              if [ -d "$dir" ]; then
+                cp -f icon.png "$dir/ic_launcher.png" || true
+                cp -f icon.png "$dir/ic_launcher_round.png" || true
+              fi
             done
           fi
-
-      - name: Build Debug APK
-        run: |
-          cd android
-          chmod +x gradlew
-          ./gradlew assembleDebug
-
-      - name: Upload APK Artifact
-        uses: actions/upload-artifact@v4
-        with:
-          name: Infinite-Reader-Offline-APK
-          path: android/app/build/outputs/apk/debug/app-debug.apk
