@@ -1,4 +1,4 @@
-name: Build Infinite Reader APK (Offline & Ad-Free)
+name: Build Infinite Reader Offline APK
 
 on:
   push:
@@ -6,55 +6,563 @@ on:
   workflow_dispatch:
 
 jobs:
-  build-android-apk:
+  build-apk:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Setup Node.js 20
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: '20'
 
-      - name: Setup Java 17
+      - name: Set up Java 17
         uses: actions/setup-java@v4
         with:
           distribution: 'temurin'
           java-version: '17'
 
-      - name: Prepare www & Bundle Offline Vendor Libraries
-        run: |
-          mkdir -p www/vendor
-          if [ -f "index.html" ] && [ ! -f "www/index.html" ]; then cp index.html www/index.html; fi
-          if [ -f "icon.png" ] && [ ! -f "www/icon.png" ]; then cp icon.png www/icon.png; fi
-          curl -fsSL https://cdn.tailwindcss.com -o www/vendor/tailwind.js
-          curl -fsSL https://unpkg.com/lucide@0.460.0/dist/umd/lucide.min.js -o www/vendor/lucide.min.js
-          curl -fsSL https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js -o www/vendor/pdf.min.js
-          curl -fsSL https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js -o www/vendor/pdf.worker.min.js
-          curl -fsSL https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js -o www/vendor/jspdf.umd.min.js
+      - name: Setup Android SDK
+        uses: android-actions/setup-android@v3
 
-      - name: Install Capacitor Dependencies
+      - name: Unzip Project & Inject Bridge into index.html
+        run: |
+          if ls *.zip 1> /dev/null 2>&1; then
+            mkdir -p _unzipped
+            unzip -o "*.zip" -d _unzipped
+            PKG_DIR=$(dirname "$(find _unzipped -name "package.json" | head -n 1)")
+            if [ -n "$PKG_DIR" ] && [ -d "$PKG_DIR" ]; then
+              cp -rf "$PKG_DIR"/* .
+            else
+              cp -rf _unzipped/* .
+            fi
+            rm -rf _unzipped
+          fi
+
+          node - << 'EOF'
+          const fs = require('fs');
+          if (fs.existsSync('index.html')) {
+            let html = fs.readFileSync('index.html', 'utf8');
+            if (!html.includes('infinite-bridge.js')) {
+              if (html.includes('</body>')) {
+                html = html.replace('</body>', '  <script src="infinite-bridge.js"></script>\n</body>');
+              } else {
+                html += '\n<script src="infinite-bridge.js"></script>\n';
+              }
+              fs.writeFileSync('index.html', html);
+              console.log('Injected infinite-bridge.js into index.html');
+            }
+          }
+          EOF
+
+      - name: Install NPM Dependencies
         run: npm install
 
-      - name: Generate Android Project & Sync
+      - name: Prepare Web Assets
+        run: |
+          mkdir -p www
+          cp -f index.html www/ || true
+          cp -f icon.png www/ || true
+          cp -f infinite-bridge.js www/ || true
+          find . -maxdepth 1 \( -name "*.js" -o -name "*.css" \) ! -name "capacitor.config.*" -exec cp -f {} www/ \; || true
+
+      - name: Add Capacitor Android Platform
         run: |
           if [ ! -d "android" ]; then
             npx cap add android
           fi
           npx cap sync android
 
-      - name: Apply App Icon & Storage/Camera Permissions
+      - name: Inject Native Layers (MediaStore, Intent Filter, Coroutines, Lifecycle Auto-Save)
         run: |
-          for dir in android/app/src/main/res/mipmap-mdpi android/app/src/main/res/mipmap-hdpi android/app/src/main/res/mipmap-xhdpi android/app/src/main/res/mipmap-xxhdpi android/app/src/main/res/mipmap-xxxhdpi; do
-            mkdir -p "$dir"
-            cp www/icon.png "$dir/ic_launcher.png"
-            cp www/icon.png "$dir/ic_launcher_round.png"
-          done
-          MANIFEST="android/app/src/main/AndroidManifest.xml"
-          if ! grep -q "android.permission.CAMERA" "$MANIFEST"; then
-            sed -i 's|<application|<uses-permission android:name="android.permission.CAMERA" />\n    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" />\n    <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" />\n    <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />\n    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />\n    <application android:requestLegacyExternalStorage="true"|' "$MANIFEST"
+          node - << 'EOF'
+          const fs = require('fs');
+          const path = require('path');
+
+          const capConfig = JSON.parse(fs.readFileSync('capacitor.config.json', 'utf8'));
+          const appId = capConfig.appId || 'com.infinitereader.app';
+          const pkgPath = appId.replace(/\./g, '/');
+          const javaDir = path.join('android/app/src/main/java', pkgPath);
+          fs.mkdirSync(javaDir, { recursive: true });
+
+          const oldMainJava = path.join(javaDir, 'MainActivity.java');
+          if (fs.existsSync(oldMainJava)) fs.unlinkSync(oldMainJava);
+
+          const mainActivityKt = `package ${appId}
+
+          import android.content.Intent
+          import android.os.Bundle
+          import com.getcapacitor.BridgeActivity
+
+          class MainActivity : BridgeActivity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  registerPlugin(InfiniteReaderPlugin::class.java)
+                  super.onCreate(savedInstanceState)
+                  handleIncomingIntent(intent)
+              }
+
+              override fun onNewIntent(intent: Intent) {
+                  super.onNewIntent(intent)
+                  setIntent(intent)
+                  handleIncomingIntent(intent)
+              }
+
+              private fun handleIncomingIntent(intent: Intent?) {
+                  if (intent == null) return
+                  val action = intent.action
+                  val uri = when (action) {
+                      Intent.ACTION_VIEW -> intent.data
+                      Intent.ACTION_SEND -> intent.getParcelableExtra(Intent.EXTRA_STREAM)
+                      else -> null
+                  }
+                  if (uri != null) {
+                      InfiniteReaderPlugin.onIncomingUri(uri.toString(), intent.type ?: "*/*")
+                  }
+              }
+
+              override fun onPause() {
+                  InfiniteReaderPlugin.triggerAutoSaveOnLifecycle()
+                  super.onPause()
+              }
+
+              override fun onStop() {
+                  InfiniteReaderPlugin.triggerAutoSaveOnLifecycle()
+                  super.onStop()
+              }
+          }
+          `;
+          fs.writeFileSync(path.join(javaDir, 'MainActivity.kt'), mainActivityKt.replace(/^          /gm, ''));
+
+          const pluginKt = `package ${appId}
+
+          import android.Manifest
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.media.MediaScannerConnection
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Environment
+          import android.provider.MediaStore
+          import android.provider.OpenableColumns
+          import android.provider.Settings
+          import android.util.Base64
+          import androidx.core.app.ActivityCompat
+          import androidx.core.content.ContextCompat
+          import com.getcapacitor.JSArray
+          import com.getcapacitor.JSObject
+          import com.getcapacitor.Plugin
+          import com.getcapacitor.PluginCall
+          import com.getcapacitor.PluginMethod
+          import com.getcapacitor.annotation.CapacitorPlugin
+          import kotlinx.coroutines.*
+          import java.io.File
+          import java.io.FileOutputStream
+
+          @CapacitorPlugin(name = "InfiniteReader")
+          class InfiniteReaderPlugin : Plugin() {
+
+              private val ioScope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+              companion object {
+                  private var instance: InfiniteReaderPlugin? = null
+                  private var pendingUri: String? = null
+                  private var pendingMime: String? = null
+
+                  @Volatile
+                  var isModified: Boolean = false
+                  private var cachedFileName: String? = null
+                  private var cachedTargetPath: String? = null
+                  private var cachedMimeType: String = "application/octet-stream"
+                  private var tempCacheFile: File? = null
+
+                  fun onIncomingUri(uri: String, mime: String) {
+                      pendingUri = uri
+                      pendingMime = mime
+                      instance?.let { plugin ->
+                          val obj = JSObject().apply {
+                              put("uri", uri)
+                              put("mimeType", mime)
+                          }
+                          plugin.notifyListeners("onExternalFileIntent", obj)
+                      }
+                  }
+
+                  fun triggerAutoSaveOnLifecycle() {
+                      if (!isModified) return
+                      val plugin = instance ?: return
+                      val cacheFile = tempCacheFile ?: return
+                      if (!cacheFile.exists()) return
+
+                      plugin.ioScope.launch {
+                          try {
+                              val outFile = if (!cachedTargetPath.isNullOrEmpty()) {
+                                  File(cachedTargetPath!!)
+                              } else {
+                                  val docsDir = File(
+                                      Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
+                                      "InfiniteReader"
+                                  )
+                                  if (!docsDir.exists()) docsDir.mkdirs()
+                                  File(docsDir, cachedFileName ?: "autosaved_doc.txt")
+                              }
+                              outFile.parentFile?.mkdirs()
+                              cacheFile.inputStream().use { input ->
+                                  FileOutputStream(outFile).use { output ->
+                                      input.copyTo(output)
+                                  }
+                              }
+                              MediaScannerConnection.scanFile(
+                                  plugin.context,
+                                  arrayOf(outFile.absolutePath),
+                                  arrayOf(cachedMimeType),
+                                  null
+                              )
+                              isModified = false
+                              withContext(Dispatchers.Main) {
+                                  val res = JSObject().apply {
+                                      put("path", outFile.absolutePath)
+                                      put("uri", Uri.fromFile(outFile).toString())
+                                      put("name", outFile.name)
+                                  }
+                                  plugin.notifyListeners("onAutoSaveComplete", res)
+                              }
+                          } catch (e: Exception) {
+                              e.printStackTrace()
+                          }
+                      }
+                  }
+              }
+
+              override fun load() {
+                  super.load()
+                  instance = this
+              }
+
+              @PluginMethod
+              fun checkStoragePermission(call: PluginCall) {
+                  val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      Environment.isExternalStorageManager()
+                  } else {
+                      ContextCompat.checkSelfPermission(
+                          context,
+                          Manifest.permission.READ_EXTERNAL_STORAGE
+                      ) == PackageManager.PERMISSION_GRANTED
+                  }
+                  call.resolve(JSObject().put("granted", granted))
+              }
+
+              @PluginMethod
+              fun requestStoragePermission(call: PluginCall) {
+                  if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                      if (!Environment.isExternalStorageManager()) {
+                          try {
+                              val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                              intent.data = Uri.parse("package:" + context.packageName)
+                              activity.startActivity(intent)
+                          } catch (e: Exception) {
+                              val intent = Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION)
+                              activity.startActivity(intent)
+                          }
+                      }
+                      call.resolve(JSObject().put("requested", true))
+                  } else {
+                      ActivityCompat.requestPermissions(
+                          activity,
+                          arrayOf(
+                              Manifest.permission.READ_EXTERNAL_STORAGE,
+                              Manifest.permission.WRITE_EXTERNAL_STORAGE
+                          ),
+                          1001
+                      )
+                      call.resolve(JSObject().put("requested", true))
+                  }
+              }
+
+              @PluginMethod
+              fun queryMediaStoreDocuments(call: PluginCall) {
+                  ioScope.launch {
+                      val filesArray = JSArray()
+                      val allowedExts = setOf("pdf", "txt", "docx", "md", "rtf", "epub", "cbz", "jpg", "jpeg", "png", "webp")
+                      val projection = arrayOf(
+                          MediaStore.Files.FileColumns._ID,
+                          MediaStore.Files.FileColumns.DISPLAY_NAME,
+                          MediaStore.Files.FileColumns.DATA,
+                          MediaStore.Files.FileColumns.MIME_TYPE,
+                          MediaStore.Files.FileColumns.SIZE,
+                          MediaStore.Files.FileColumns.DATE_MODIFIED
+                      )
+                      val uri = MediaStore.Files.getContentUri("external")
+                      val sortOrder = "\${MediaStore.Files.FileColumns.DATE_MODIFIED} DESC"
+
+                      try {
+                          context.contentResolver.query(uri, projection, null, null, sortOrder)?.use { cursor ->
+                              val idCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns._ID)
+                              val nameCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DISPLAY_NAME)
+                              val dataCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATA)
+                              val mimeCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.MIME_TYPE)
+                              val sizeCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.SIZE)
+                              val dateCol = cursor.getColumnIndexOrThrow(MediaStore.Files.FileColumns.DATE_MODIFIED)
+
+                              while (cursor.moveToNext()) {
+                                  val name = cursor.getString(nameCol) ?: continue
+                                  val ext = name.substringAfterLast('.', "").lowercase()
+                                  if (ext !in allowedExts) continue
+
+                                  val fileId = cursor.getLong(idCol)
+                                  val path = cursor.getString(dataCol) ?: ""
+                                  val mime = cursor.getString(mimeCol) ?: "application/octet-stream"
+                                  val size = cursor.getLong(sizeCol)
+                                  val modified = cursor.getLong(dateCol)
+                                  val contentUri = Uri.withAppendedPath(uri, fileId.toString()).toString()
+
+                                  filesArray.put(JSObject().apply {
+                                      put("id", fileId)
+                                      put("name", name)
+                                      put("path", path)
+                                      put("uri", contentUri)
+                                      put("mimeType", mime)
+                                      put("size", size)
+                                      put("dateModified", modified * 1000)
+                                      put("ext", ext)
+                                  })
+                              }
+                          }
+                      } catch (e: Exception) {
+                          e.printStackTrace()
+                      }
+
+                      withContext(Dispatchers.Main) {
+                          call.resolve(JSObject().put("files", filesArray))
+                      }
+                  }
+              }
+
+              @PluginMethod
+              fun getPendingIntentFile(call: PluginCall) {
+                  val res = JSObject()
+                  if (pendingUri != null) {
+                      res.put("uri", pendingUri)
+                      res.put("mimeType", pendingMime ?: "*/*")
+                      pendingUri = null
+                      pendingMime = null
+                  }
+                  call.resolve(res)
+              }
+
+              @PluginMethod
+              fun readContentUri(call: PluginCall) {
+                  val uriStr = call.getString("uri") ?: return call.reject("Missing URI")
+                  ioScope.launch {
+                      try {
+                          val uri = Uri.parse(uriStr)
+                          var displayName = "document"
+                          context.contentResolver.query(uri, null, null, null, null)?.use { c ->
+                              val idx = c.getColumnIndex(OpenableColumns.DISPLAY_NAME)
+                              if (idx >= 0 && c.moveToFirst()) {
+                                  displayName = c.getString(idx) ?: displayName
+                              }
+                          }
+                          val mime = context.contentResolver.getType(uri) ?: "application/octet-stream"
+                          val bytes = context.contentResolver.openInputStream(uri)?.use { it.readBytes() }
+                              ?: ByteArray(0)
+                          val base64 = Base64.encodeToString(bytes, Base64.NO_WRAP)
+
+                          withContext(Dispatchers.Main) {
+                              call.resolve(JSObject().apply {
+                                  put("uri", uriStr)
+                                  put("name", displayName)
+                                  put("mimeType", mime)
+                                  put("base64Data", base64)
+                              })
+                          }
+                      } catch (e: Exception) {
+                          withContext(Dispatchers.Main) {
+                              call.reject("Error reading URI: \${e.message}")
+                          }
+                      }
+                  }
+              }
+
+              @PluginMethod
+              fun saveFileWithCallback(call: PluginCall) {
+                  val fileName = call.getString("fileName") ?: "InfiniteReader_\${System.currentTimeMillis()}.pdf"
+                  val base64Data = call.getString("base64Data") ?: return call.reject("Missing base64Data")
+                  val mimeType = call.getString("mimeType") ?: "application/octet-stream"
+
+                  ioScope.launch {
+                      try {
+                          val cleanBase64 = base64Data.substringAfter(",")
+                          val bytes = Base64.decode(cleanBase64, Base64.DEFAULT)
+
+                          val docsDir = File(
+                              Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOCUMENTS),
+                              "InfiniteReader"
+                          )
+                          if (!docsDir.exists()) docsDir.mkdirs()
+
+                          val outFile = File(docsDir, fileName)
+                          FileOutputStream(outFile).use { fos ->
+                              fos.write(bytes)
+                              fos.flush()
+                          }
+
+                          MediaScannerConnection.scanFile(
+                              context,
+                              arrayOf(outFile.absolutePath),
+                              arrayOf(mimeType),
+                              null
+                          )
+
+                          val fileUri = Uri.fromFile(outFile).toString()
+                          withContext(Dispatchers.Main) {
+                              val res = JSObject().apply {
+                                  put("uri", fileUri)
+                                  put("path", outFile.absolutePath)
+                                  put("name", outFile.name)
+                                  put("mimeType", mimeType)
+                              }
+                              notifyListeners("onFileProcessingComplete", res)
+                              call.resolve(res)
+                          }
+                      } catch (e: Exception) {
+                          withContext(Dispatchers.Main) {
+                              call.reject("Save failed: \${e.message}")
+                          }
+                      }
+                  }
+              }
+
+              @PluginMethod
+              fun markModified(call: PluginCall) {
+                  val fileName = call.getString("fileName") ?: "edited_doc.txt"
+                  val path = call.getString("path") ?: ""
+                  val base64Data = call.getString("base64Data") ?: return call.reject("Missing data")
+                  val mimeType = call.getString("mimeType") ?: "application/octet-stream"
+
+                  ioScope.launch {
+                      try {
+                          val cleanBase64 = base64Data.substringAfter(",")
+                          val bytes = Base64.decode(cleanBase64, Base64.DEFAULT)
+                          val cacheFile = File(context.cacheDir, "autosave_buffer_\$fileName")
+                          FileOutputStream(cacheFile).use { it.write(bytes) }
+
+                          cachedFileName = fileName
+                          cachedTargetPath = path
+                          cachedMimeType = mimeType
+                          tempCacheFile = cacheFile
+                          isModified = true
+
+                          withContext(Dispatchers.Main) {
+                              call.resolve(JSObject().put("isModified", true))
+                          }
+                      } catch (e: Exception) {
+                          withContext(Dispatchers.Main) {
+                              call.reject("Cache failed: \${e.message}")
+                          }
+                      }
+                  }
+              }
+
+              @PluginMethod
+              fun clearModified(call: PluginCall) {
+                  isModified = false
+                  tempCacheFile?.delete()
+                  tempCacheFile = null
+                  call.resolve(JSObject().put("isModified", false))
+              }
+
+              @PluginMethod
+              fun forceAutoSave(call: PluginCall) {
+                  triggerAutoSaveOnLifecycle()
+                  call.resolve(JSObject().put("triggered", true))
+              }
+          }
+          `;
+          fs.writeFileSync(path.join(javaDir, 'InfiniteReaderPlugin.kt'), pluginKt.replace(/^          /gm, ''));
+
+          let rootGradle = fs.readFileSync('android/build.gradle', 'utf8');
+          if (!rootGradle.includes('kotlin-gradle-plugin')) {
+            rootGradle = rootGradle.replace(
+              /dependencies\s*\{/,
+              `dependencies {\n        classpath "org.jetbrains.kotlin:kotlin-gradle-plugin:1.9.22"`
+            );
+            fs.writeFileSync('android/build.gradle', rootGradle);
+          }
+
+          let appGradle = fs.readFileSync('android/app/build.gradle', 'utf8');
+          if (!appGradle.includes('kotlin-android')) {
+            appGradle = appGradle.replace(
+              /apply plugin: 'com\.android\.application'/,
+              `apply plugin: 'com.android.application'\napply plugin: 'kotlin-android'`
+            );
+          }
+          if (!appGradle.includes('kotlinx-coroutines-android')) {
+            appGradle = appGradle.replace(
+              /dependencies\s*\{/,
+              `dependencies {\n    implementation "org.jetbrains.kotlinx:kotlinx-coroutines-android:1.7.3"`
+            );
+          }
+          fs.writeFileSync('android/app/build.gradle', appGradle);
+
+          let manifest = fs.readFileSync('android/app/src/main/AndroidManifest.xml', 'utf8');
+          const permissions = `
+              <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+              <uses-permission android:name="android.permission.WRITE_EXTERNAL_STORAGE" android:maxSdkVersion="29" />
+              <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" />
+              <uses-permission android:name="android.permission.READ_MEDIA_IMAGES" />
+              <uses-permission android:name="android.permission.CAMERA" />`;
+
+          if (!manifest.includes('MANAGE_EXTERNAL_STORAGE')) {
+            manifest = manifest.replace('</manifest>', `${permissions}\n</manifest>`);
+          }
+          if (!manifest.includes('requestLegacyExternalStorage')) {
+            manifest = manifest.replace('<application', '<application android:requestLegacyExternalStorage="true"');
+          }
+
+          const intentFilters = `
+                  <intent-filter>
+                      <action android:name="android.intent.action.VIEW" />
+                      <category android:name="android.intent.category.DEFAULT" />
+                      <category android:name="android.intent.category.BROWSABLE" />
+                      <data android:scheme="file" />
+                      <data android:scheme="content" />
+                      <data android:mimeType="application/pdf" />
+                      <data android:mimeType="text/plain" />
+                      <data android:mimeType="text/markdown" />
+                      <data android:mimeType="text/rtf" />
+                      <data android:mimeType="application/rtf" />
+                      <data android:mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
+                      <data android:mimeType="application/msword" />
+                      <data android:mimeType="application/epub+zip" />
+                      <data android:mimeType="application/vnd.comicbook+zip" />
+                      <data android:mimeType="application/x-cbz" />
+                      <data android:mimeType="image/*" />
+                  </intent-filter>
+                  <intent-filter>
+                      <action android:name="android.intent.action.SEND" />
+                      <category android:name="android.intent.category.DEFAULT" />
+                      <data android:mimeType="application/pdf" />
+                      <data android:mimeType="text/plain" />
+                      <data android:mimeType="application/vnd.openxmlformats-officedocument.wordprocessingml.document" />
+                      <data android:mimeType="application/epub+zip" />
+                      <data android:mimeType="image/*" />
+                  </intent-filter>`;
+
+          if (!manifest.includes('application/epub+zip')) {
+            manifest = manifest.replace('</activity>', `${intentFilters}\n        </activity>`);
+          }
+          fs.writeFileSync('android/app/src/main/AndroidManifest.xml', manifest);
+          EOF
+
+      - name: Apply App Icon
+        run: |
+          if [ -f icon.png ]; then
+            for dir in android/app/src/main/res/mipmap-*; do
+              cp -f icon.png "$dir/ic_launcher.png" || true
+              cp -f icon.png "$dir/ic_launcher_round.png" || true
+            done
           fi
 
       - name: Build Debug APK
@@ -63,9 +571,8 @@ jobs:
           chmod +x gradlew
           ./gradlew assembleDebug
 
-      - name: Upload Infinite Reader APK
+      - name: Upload APK Artifact
         uses: actions/upload-artifact@v4
         with:
           name: Infinite-Reader-Offline-APK
           path: android/app/build/outputs/apk/debug/app-debug.apk
-          retention-days: 30
